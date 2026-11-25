@@ -28,7 +28,7 @@ var STATUS = {
   UPLOADING: 'מעלה קבצים…',
   DONE: 'הושלם',
   DONE_NO_VIDEO_FAIL: 'נשמר – הסרטון לא עלה',
-  NO_PHOTO: 'נשמר – חסרה תמונה',
+  NO_PHOTO: 'נשמר – התמונה לא עלתה',
   STUCK: 'נשמר – ההעלאה לא הושלמה'
 };
 
@@ -45,7 +45,8 @@ function now_(fmt) { return Utilities.formatDate(new Date(), 'Asia/Jerusalem', f
 // הדף עצמו מתארח מחוץ לגוגל (GitHub Pages) כדי שהתחברות לחשבונות גוגל לא תפריע למשתתפים.
 // כאן רק API: הדף שולח POST עם {fn, args} ומקבל JSON.
 var PUBLIC_PAGE_URL = 'https://nave-napa.github.io/saltiz-signup/';
-var API = { beginSubmission: beginSubmission, startUpload: startUpload, uploadChunk: uploadChunk, finalize: finalize };
+var API = { beginSubmission: beginSubmission, newSession: newSession, startUpload: startUpload, uploadChunk: uploadChunk, finalize: finalize };
+var ALLOWED_ORIGINS = ['https://nave-napa.github.io'];
 
 function doPost(e) {
   var out;
@@ -209,7 +210,20 @@ function verifyCaptcha_(captchaToken) {
   if (!j.success) throw new Error('האימות "אני לא רובוט" נכשל. סמנו שוב ונסו שוב.');
 }
 
-function beginSubmission(captchaToken, subId, data) {
+function beginSubmission(captchaToken, subId, data, files, origin) {
+  var r = beginSubmission_(captchaToken, subId, data);
+  // יצירת קישורי העלאה ישירה לדרייב (הדפדפן מעלה ישר לגוגל – מהיר בהרבה)
+  r.uploads = {};
+  if (files && ALLOWED_ORIGINS.indexOf(origin) !== -1) {
+    files.forEach(function (f) {
+      try { r.uploads[f.kind] = createSession_(subId, f.kind, f.name, f.type, f.size, origin).url; }
+      catch (e) { console.error('session', e); }
+    });
+  }
+  return r;
+}
+
+function beginSubmission_(captchaToken, subId, data) {
   if (!/^[0-9a-f-]{20,40}$/i.test(String(subId))) throw new Error('מזהה לא תקין. רעננו את הדף.');
   // ניסיון חוזר של אותה הגשה (למשל נפל אינטרנט) – מחזירים את אותו טוקן בלי כפילות
   var existingTok = cache_().get('sub_' + subId);
@@ -230,6 +244,7 @@ function beginSubmission(captchaToken, subId, data) {
   rec.photoId = '';
   rec.videoId = '';
   rec.wantsVideo = !!(data && data.wantsVideo);
+  rec.wantsPhoto = !!(data && data.wantsPhoto);
 
   var token = Utilities.getUuid();
   cache_().put('tok_' + token, subId, CONFIG.sessionTtlSec);
@@ -244,6 +259,16 @@ function beginSubmission(captchaToken, subId, data) {
   return { token: token };
 }
 
+// סטטוס לפי מה שהמשתתף ביקש להעלות ומה שבפועל עלה
+function statusFor_(rec, stale, videoFailed) {
+  var photoOk = rec.photoId || !rec.wantsPhoto;
+  var videoOk = rec.videoId || !rec.wantsVideo;
+  if (photoOk && videoOk) return STATUS.DONE;
+  if (!stale && !videoFailed && rec.status === STATUS.UPLOADING) return STATUS.UPLOADING;
+  if (!photoOk) return STATUS.NO_PHOTO;
+  return STATUS.DONE_NO_VIDEO_FAIL;
+}
+
 function subForToken_(token) {
   var sub = token && cache_().get('tok_' + token);
   if (!sub) throw new Error('פג תוקף ההגשה. רעננו את הדף ונסו שוב.');
@@ -251,8 +276,7 @@ function subForToken_(token) {
 }
 
 // ---------- העלאת קבצים (resumable ל-Drive, בחלקים) ----------
-function startUpload(token, kind, fileName, mimeType, size) {
-  var subId = subForToken_(token);
+function createSession_(subId, kind, fileName, mimeType, size, origin) {
   if (kind !== 'photo' && kind !== 'video') throw new Error('סוג קובץ לא תקין');
   size = Number(size);
   if (!(size > 0)) throw new Error('הקובץ ריק');
@@ -264,21 +288,34 @@ function startUpload(token, kind, fileName, mimeType, size) {
   var rec = readBackup_(subId) || {};
   var ext = (String(fileName).match(/\.[A-Za-z0-9]{1,5}$/) || [''])[0];
   var safeName = String(rec.name || '').replace(/^'/, '').replace(/[\\\/:*?"<>|]/g, '').substring(0, 60).trim() || 'משתתף';
-  // המזהה בשם הקובץ מאפשר ל-reconcile לשייך קובץ להרשמה גם אם הדף נסגר
+  // המזהה בשם ובתיאור הקובץ מאפשר לשייך קובץ להרשמה גם אם הדף נסגר
   var name = now_('yyyy-MM-dd_HH-mm') + '_' + safeName + '_' + (kind === 'photo' ? 'תמונה' : 'סרטון') + '_' + subId.substring(0, 8) + ext;
-
-  var res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true', {
-    method: 'post',
-    contentType: 'application/json; charset=UTF-8',
-    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), 'X-Upload-Content-Type': mimeType, 'X-Upload-Content-Length': String(size) },
+  var headers = { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), 'X-Upload-Content-Type': mimeType, 'X-Upload-Content-Length': String(size) };
+  if (origin) headers.Origin = origin;
+  var res = UrlFetchApp.fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable&supportsAllDrives=true&fields=id', {
+    method: 'post', contentType: 'application/json; charset=UTF-8', headers: headers,
     payload: JSON.stringify({ name: name, parents: [props_().getProperty('FOLDER_ID')], mimeType: mimeType,
                               description: 'submission:' + subId + ' kind:' + kind }),
     muteHttpExceptions: true
   });
   if (res.getResponseCode() !== 200) throw new Error('שגיאה בפתיחת ההעלאה (' + res.getResponseCode() + ')');
   var h = res.getAllHeaders();
+  return { url: h['Location'] || h['location'], size: size };
+}
+
+// קישור העלאה ישירה חדש (לניסיון חוזר)
+function newSession(token, kind, fileName, mimeType, size, origin) {
+  var subId = subForToken_(token);
+  if (ALLOWED_ORIGINS.indexOf(origin) === -1) throw new Error('מקור לא מורשה');
+  return { url: createSession_(subId, kind, fileName, mimeType, size, origin).url };
+}
+
+// מסלול גיבוי: העלאה בחלקים דרך הסקריפט (אם ההעלאה הישירה נכשלה)
+function startUpload(token, kind, fileName, mimeType, size) {
+  var subId = subForToken_(token);
+  var s = createSession_(subId, kind, fileName, mimeType, size, null);
   var uploadId = Utilities.getUuid();
-  cache_().put('up_' + uploadId, JSON.stringify({ url: h['Location'] || h['location'], token: token, size: size, kind: kind }), 6 * 3600);
+  cache_().put('up_' + uploadId, JSON.stringify({ url: s.url, token: token, size: s.size, kind: kind }), 6 * 3600);
   return { uploadId: uploadId };
 }
 
@@ -305,12 +342,12 @@ function uploadChunk(token, uploadId, start, b64) {
   throw new Error('שגיאה בהעלאה (' + code + ')');
 }
 
-function checkUploadedFile_(fileId, token, kind) {
+function checkUploadedFile_(fileId, subId, kind) {
   if (!fileId) return '';
-  var rec = cache_().get('file_' + fileId);
-  if (!rec) return '';
-  rec = JSON.parse(rec);
-  return (rec.token === token && rec.kind === kind) ? fileId : '';
+  try {
+    var f = DriveApp.getFileById(String(fileId));
+    return String(f.getDescription() || '') === 'submission:' + subId + ' kind:' + kind ? f.getId() : '';
+  } catch (e) { return ''; }
 }
 
 // ---------- סיום: עדכון השורה עם הקבצים ----------
@@ -318,11 +355,11 @@ function finalize(token, photoId, videoId, videoFailed) {
   var subId = subForToken_(token);
   var rec = readBackup_(subId);
   if (!rec) throw new Error('ההרשמה לא נמצאה. פנו להפקה.');
-  var p = checkUploadedFile_(photoId, token, 'photo');
-  var v = checkUploadedFile_(videoId, token, 'video');
+  var p = checkUploadedFile_(photoId, subId, 'photo');
+  var v = checkUploadedFile_(videoId, subId, 'video');
   if (p) rec.photoId = p;
   if (v) rec.videoId = v;
-  rec.status = !rec.photoId ? STATUS.NO_PHOTO : (videoFailed && !rec.videoId ? STATUS.DONE_NO_VIDEO_FAIL : STATUS.DONE);
+  rec.status = statusFor_(rec, false, videoFailed);
   rec.updatedAt = now_();
   var errs = [];
   try { writeBackup_(rec); } catch (e) { errs.push('backup: ' + e); }
@@ -363,8 +400,10 @@ function reconcile() {
     if (rec.status === STATUS.UPLOADING || rec.status === STATUS.STUCK || rec.status === STATUS.NO_PHOTO) {
       var old = rec.status;
       var stale = Date.now() - (rec.createdMs || 0) > CONFIG.stuckAfterMin * 60000;
-      if (rec.photoId && (rec.videoId || !rec.wantsVideo)) rec.status = STATUS.DONE;
-      else if (stale) rec.status = rec.photoId ? STATUS.DONE_NO_VIDEO_FAIL : STATUS.STUCK;
+      if (rec.wantsPhoto === undefined) rec.wantsPhoto = true;   // הרשמות מלפני שהתמונה הפכה לרשות
+      var st = statusFor_(rec, stale, false);
+      if (st !== STATUS.UPLOADING || !stale) rec.status = st;
+      if (stale && rec.status === STATUS.UPLOADING) rec.status = STATUS.STUCK;
       if (rec.status !== old) changed = true;
     }
     if (changed) { writeBackup_(rec); fixed.push(rec.name); }

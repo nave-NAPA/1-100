@@ -100,14 +100,14 @@
     </div>
 
     <div class="card" data-f="photo">
-      <label class="q">תמונה של המשתתף<span class="req">*</span></label>
+      <label class="q">תמונה של המשתתף (לא חובה)</label>
       <div class="hint">אפשר לצלם עכשיו או להעלות תמונה מהגלריה</div>
       <div class="media-btns">
         <label class="mbtn">📸 צילום תמונה<input type="file" accept="image/*" capture="environment" data-kind="photo"></label>
         <label class="mbtn">🖼️ העלאה מהגלריה<input type="file" accept="image/*" data-kind="photo"></label>
       </div>
       <div class="preview" id="pv-photo"></div>
-      <div class="err">יש לצרף תמונה</div>
+      <div class="err">התמונה לא תקינה</div>
     </div>
 
     <div class="card" data-f="video">
@@ -178,7 +178,7 @@ function formData() {
   return {
     referrer: $('referrer').value, name: $('name').value.trim(), age: $('age').value, contactPhone: $('phone').value,
     days: Array.prototype.map.call(document.querySelectorAll('#days input:checked'), function (i) { return i.value; }),
-    hour: $('hour').value, wantsVideo: !!files.video
+    hour: $('hour').value, wantsVideo: !!files.video, wantsPhoto: !!files.photo
   };
 }
 var draft = lsGet() || {};
@@ -242,16 +242,16 @@ function alertCard(card, msg) { var e = card.querySelector('.err'); e.textConten
 
 function compressImage(file) {
   return new Promise(function (resolve, reject) {
-    if (file.size < 1.5 * 1048576) return resolve(file);
+    if (file.size < 400 * 1024) return resolve(file);
     var img = new Image();
     img.onload = function () {
-      var max = 2000, w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, max / Math.max(w, h));
+      var max = 1600, w = img.naturalWidth, h = img.naturalHeight, s = Math.min(1, max / Math.max(w, h));
       var c = document.createElement('canvas'); c.width = Math.round(w * s); c.height = Math.round(h * s);
       c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
       c.toBlob(function (b) {
         if (!b) return reject();
         resolve(new File([b], (file.name || 'photo').replace(/\.\w+$/, '') + '.jpg', { type: 'image/jpeg' }));
-      }, 'image/jpeg', 0.88);
+      }, 'image/jpeg', 0.85);
     };
     img.onerror = reject;
     img.src = URL.createObjectURL(file);
@@ -288,7 +288,25 @@ function readChunkB64(blob) {
   });
 }
 
-async function uploadFile(token, kind, file, onProgress) {
+// העלאה ישירה מהדפדפן לגוגל דרייב (מהיר, עם התקדמות אמיתית)
+function putDirect(url, file, onProgress) {
+  return new Promise(function (resolve, reject) {
+    var x = new XMLHttpRequest();
+    x.open('PUT', url);
+    x.upload.onprogress = function (e) { if (e.lengthComputable) onProgress(e.loaded); };
+    x.onload = function () {
+      if (x.status === 200 || x.status === 201) {
+        try { resolve(JSON.parse(x.responseText).id); } catch (e) { reject(new Error('תגובה לא תקינה')); }
+      } else reject(new Error('שגיאה בהעלאה (' + x.status + ')'));
+    };
+    x.onerror = function () { reject(new Error('בעיית חיבור בזמן ההעלאה')); };
+    x.ontimeout = x.onerror;
+    x.send(new Blob([file]));
+  });
+}
+
+// מסלול גיבוי: העלאה בחלקים דרך השרת
+async function uploadViaServer(token, kind, file, onProgress) {
   var st = await runRetry(3, 'startUpload', token, kind, file.name || kind, file.type, file.size);
   var off = 0;
   while (off < file.size) {
@@ -302,6 +320,21 @@ async function uploadFile(token, kind, file, onProgress) {
   throw new Error('ההעלאה לא הושלמה');
 }
 
+async function uploadFile(token, kind, file, onProgress) {
+  for (var attempt = 1; attempt <= 2; attempt++) {
+    try {
+      var url = session.uploads && session.uploads[kind];
+      session.uploads[kind] = '';                    // קישור חד-פעמי
+      if (!url) url = (await runRetry(3, 'newSession', token, kind, file.name || kind, file.type, file.size, location.origin)).url;
+      return await putDirect(url, file, onProgress);
+    } catch (e) {
+      if (/גדול מדי|לא תקין/.test(errMsg(e))) throw e;
+      onProgress(0);
+    }
+  }
+  return uploadViaServer(token, kind, file, onProgress);   // אם ההעלאה הישירה לא מצליחה
+}
+
 function validate() {
   var ok = true, first = null;
   function bad(f, msg) { var c = document.querySelector('[data-f="' + f + '"]'); if (msg) c.querySelector('.err').textContent = msg; c.classList.add('bad'); ok = false; if (!first) first = c; }
@@ -310,7 +343,6 @@ function validate() {
   if ($('phone').value.replace(/\D/g, '').length < 9) bad('phone');
   if (!document.querySelectorAll('#days input:checked').length) bad('days');
   if (!$('hour').value) bad('hour');
-  if (!files.photo) bad('photo', 'יש לצרף תמונה');
   if (first) first.scrollIntoView({ behavior: 'smooth', block: 'center' });
   return ok;
 }
@@ -335,14 +367,16 @@ $('f').addEventListener('submit', async function (ev) {
   try {
     // שלב 1: הפרטים נשמרים בשרת לפני כל העלאה
     if (!session) {
-      var s = await runRetry(3, 'beginSubmission', captchaToken, draft.subId, formData());
-      session = { token: s.token, subId: draft.subId, photoId: '', videoId: '' };
+      var meta = ['photo', 'video'].filter(function (k) { return files[k]; })
+        .map(function (k) { return { kind: k, name: files[k].name || k, type: files[k].type, size: files[k].size }; });
+      var s = await runRetry(3, 'beginSubmission', captchaToken, draft.subId, formData(), meta, location.origin);
+      session = { token: s.token, subId: draft.subId, photoId: '', videoId: '', uploads: s.uploads || {} };
     }
     var name = $('name').value.trim();
-    var needPhoto = !session.photoId, needVideo = files.video && !session.videoId;
+    var needPhoto = files.photo && !session.photoId, needVideo = files.video && !session.videoId;
     var total = (needPhoto ? files.photo.size : 0) + (needVideo ? files.video.size : 0) || 1, sent = 0;
 
-    // שלב 2: תמונה (חובה)
+    // שלב 2: תמונה (רשות)
     stage = 'photo';
     if (needPhoto) {
       setProgress(3, 'מעלים את התמונה…');
