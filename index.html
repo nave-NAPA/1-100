@@ -40,7 +40,8 @@
   .submit { width:100%; margin-top:18px; padding:16px; font:inherit; font-size:18px; font-weight:800; color:#fff; border:0; border-radius:14px; background:linear-gradient(135deg,var(--brand),var(--brand2)); cursor:pointer; box-shadow:0 8px 20px rgba(91,61,245,.3); }
   .submit:disabled { opacity:.6; cursor:default; }
   .captcha { display:flex; justify-content:center; margin-top:14px; min-height:78px; }
-  .hp { position:absolute; left:-9999px; width:1px; height:1px; overflow:hidden; }
+  .hp { position:absolute; width:1px; height:1px; overflow:hidden; opacity:0; pointer-events:none; clip-path:inset(50%); }
+  html, body { overflow-x:hidden; }
   .overlay { position:fixed; inset:0; background:rgba(26,21,48,.6); display:none; align-items:center; justify-content:center; z-index:10; padding:20px; }
   .box { background:#fff; border-radius:20px; padding:26px 22px; width:100%; max-width:420px; text-align:center; }
   .box h2 { margin:0 0 6px; font-size:21px; }
