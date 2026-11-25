@@ -25,7 +25,7 @@ var CONFIG = {
   maxPhotoBytes: 30 * 1024 * 1024,
   maxVideoBytes: 300 * 1024 * 1024,
   sessionTtlSec: 6 * 60 * 60,
-  maxSubmissionsPerHour: 120,
+  maxSubmissionsPer10Min: 600,
   stuckAfterMin: 60
 };
 
@@ -62,12 +62,35 @@ function doPost(e) {
     if (!fn) throw new Error('פעולה לא מוכרת');
     out = { ok: true, result: fn.apply(null, req.args || []) };
   } catch (err) {
-    out = { ok: false, error: String(err && err.message ? err.message : err) };
+    var msg = String(err && err.message ? err.message : err);
+    out = { ok: false, error: msg };
+    if (!isUserError_(msg)) { bumpCounter_('ERR', 600); console.error('server error', msg); }
   }
+  bumpCounter_('REQ', 600);
   return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
 }
 
-function doGet() {
+// שגיאות של המשתמש (שדה חסר, קפצ'ה) – לא נספרות כתקלה בשרת
+function isUserError_(m) { return /יש ל|לא תקין|גדול מדי|רובוט|פג תוקף|לא מוכרת|ארוך מדי|מזהה לא|הקובץ ריק|יש לבחור|יש לסמן|לא מורשה/.test(m); }
+
+// מונים מהירים בזיכרון מטמון (בלי נעילות) – לחלונות זמן של 10 דקות
+function bumpCounter_(name, ttl) {
+  try {
+    var key = 'C_' + name + '_' + Math.floor(Date.now() / 600000);
+    var c = cache_(), n = Number(c.get(key) || 0) + 1;
+    c.put(key, String(n), ttl || 900);
+    return n;
+  } catch (e) { return 0; }
+}
+function readCounter_(name) {
+  var b = Math.floor(Date.now() / 600000), c = cache_();
+  return Number(c.get('C_' + name + '_' + b) || 0) + Number(c.get('C_' + name + '_' + (b - 1)) || 0);
+}
+
+function doGet(e) {
+  if (e && e.parameter && e.parameter.health !== undefined) {   // בדיקת תקינות ל-NAPA / ניטור
+    return ContentService.createTextOutput(JSON.stringify(health())).setMimeType(ContentService.MimeType.JSON);
+  }
   return HtmlService.createHtmlOutput('<div dir="rtl" style="font-family:sans-serif;text-align:center;padding:40px">' +
     '<h2>הרשמה לצילומים – הסולטיז</h2><p><a target="_top" href="' + PUBLIC_PAGE_URL + '">לטופס ההרשמה לחצו כאן</a></p></div>')
     .setTitle('הרשמה לצילומים – הסולטיז');
@@ -110,8 +133,9 @@ function setup() {
     sh.protect().setDescription('הטבלה מתעדכנת אוטומטית מהטופס – לא למחוק שורות').setWarningOnly(true);
   }
   // מנגנון שחזור אוטומטי כל 15 דקות
-  var has = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'reconcile'; });
-  if (!has) ScriptApp.newTrigger('reconcile').timeBased().everyMinutes(15).create();
+  ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reconcile') ScriptApp.deleteTrigger(t); });
+  var hasMon = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'monitor'; });
+  if (!hasMon) ScriptApp.newTrigger('monitor').timeBased().everyMinutes(5).create();
   return { sheetUrl: ss.getUrl(), folderUrl: folder.getUrl() };
 }
 
@@ -201,9 +225,9 @@ function rangesText_(times) {
 }
 
 // כתיבה/עדכון שורה לפי מזהה (idempotent)
-function upsertRow_(rec) {
+function upsertRow_(rec, waitMs) {
   var lock = LockService.getScriptLock();
-  lock.waitLock(30000);
+  if (!lock.tryLock(waitMs || 20000)) { bumpCounter_('SHEET_DEFERRED', 1200); return null; }   // עמוס – הגיבוי שמור, reconcile ישלים
   try {
     var sh = sheet_();
     var row = findRow_(sh, rec.id);
@@ -304,10 +328,8 @@ function beginSubmission_(captchaToken, subId, data) {
   var rec = validate_(data || {});
   verifyCaptcha_(captchaToken);
 
-  var hk = 'SUBS_' + now_('yyyyMMddHH');
-  var n = Number(props_().getProperty(hk) || 0);
-  if (n >= CONFIG.maxSubmissionsPerHour) throw new Error('יש עומס כרגע. נסו שוב בעוד כמה דקות.');
-  props_().setProperty(hk, String(n + 1));
+  // הגנה מהצפה: מעל 600 הגשות ב-10 דקות (הרבה מעבר לעומס אמיתי) – עוצרים
+  if (bumpCounter_('SUBS', 1200) > CONFIG.maxSubmissionsPer10Min) throw new Error('יש עומס חריג כרגע. נסו שוב בעוד כמה דקות.');
 
   rec.id = subId;
   rec.createdAt = now_();
@@ -323,10 +345,13 @@ function beginSubmission_(captchaToken, subId, data) {
   cache_().put('sub_' + subId, token, CONFIG.sessionTtlSec);
 
   // שמירה כפולה: קודם גיבוי, אחר כך טבלה. אם אחד נכשל – השני מספיק, ו-reconcile ישלים.
-  var saved = false, errs = [];
-  try { writeBackup_(rec); saved = true; } catch (e) { errs.push('backup: ' + e); }
-  try { upsertRow_(rec); saved = true; } catch (e) { errs.push('sheet: ' + e); }
-  if (errs.length) alertOwner_('תקלה בשמירת הרשמה', 'שגיאות: ' + errs.join(' | ') + '\n\nפרטי ההרשמה:\n' + JSON.stringify(rec, null, 2));
+  // שמירה כפולה: קודם גיבוי (מקור האמת), אחר כך טבלה. אם הטבלה עמוסה – reconcile משלים תוך דקות.
+  var saved = false, backupOk = false, errs = [];
+  for (var att = 0; att < 3 && !backupOk; att++) {
+    try { writeBackup_(rec); backupOk = saved = true; } catch (e) { errs.push('backup: ' + e); Utilities.sleep(400 * (att + 1)); }
+  }
+  try { if (upsertRow_(rec) !== null) saved = true; } catch (e) { errs.push('sheet: ' + e); }
+  if (!backupOk) alertOwner_('תקלה בשמירת הרשמה', 'שגיאות: ' + errs.join(' | ') + '\n\nפרטי ההרשמה:\n' + JSON.stringify(rec, null, 2));
   if (!saved) throw new Error('לא הצלחנו לשמור כרגע. נסו שוב בעוד רגע – הפרטים שמילאתם לא נמחקו.');
   return { token: token, name: rec.name };
 }
@@ -438,58 +463,126 @@ function finalize(token, photoId, videoId, videoFailed, data) {
   if (v) rec.videoId = v;
   rec.status = statusFor_(rec, false, videoFailed);
   rec.updatedAt = now_();
-  var errs = [];
-  try { writeBackup_(rec); } catch (e) { errs.push('backup: ' + e); }
+  var errs = [], backupOk = false;
+  for (var att = 0; att < 3 && !backupOk; att++) {
+    try { writeBackup_(rec); backupOk = true; } catch (e) { errs.push('backup: ' + e); Utilities.sleep(400 * (att + 1)); }
+  }
   var num = '';
   try { num = upsertRow_(rec); } catch (e) { errs.push('sheet: ' + e); }
-  if (errs.length) alertOwner_('תקלה בעדכון הרשמה', errs.join(' | ') + '\n\n' + JSON.stringify(rec, null, 2));
+  if (!backupOk) alertOwner_('תקלה בעדכון הרשמה', errs.join(' | ') + '\n\n' + JSON.stringify(rec, null, 2));
   return { ok: true, number: num, status: rec.status };
 }
 
 // ---------- reconcile: רץ כל 15 דקות ----------
 function reconcile() {
-  var props = props_();
-  var folder = DriveApp.getFolderById(props.getProperty('FOLDER_ID'));
-  // מיפוי קבצים שעלו לפי מזהה ההגשה (מתוך ה-description)
-  var filesBySub = {};
-  var it = folder.getFiles();
-  while (it.hasNext()) {
-    var f = it.next();
-    var m = String(f.getDescription() || '').match(/submission:([0-9a-f-]+) kind:(photo|video)/i);
-    if (m) { filesBySub[m[1]] = filesBySub[m[1]] || {}; filesBySub[m[1]][m[2]] = f.getId(); }
-  }
-  var sh = sheet_();
-  var last = sh.getLastRow();
-  var idsInSheet = {};
+  var props = props_(), t0 = Date.now();
+  var lastFull = Number(props.getProperty('RECON_FULL_MS') || 0);
+  var lastRun = Number(props.getProperty('RECON_MS') || 0);
+  var full = t0 - lastFull > 60 * 60000;   // סריקה מלאה פעם בשעה, ובשאר הפעמים רק מה שהשתנה
+
+  var sh = sheet_(), last = sh.getLastRow(), idsInSheet = {};
   if (last >= 2) sh.getRange(2, COL.id, last - 1, 1).getValues().forEach(function (r) { idsInSheet[String(r[0])] = true; });
 
-  var restored = [], fixed = [];
-  var all = allBackups_();
-  for (var bi = 0; bi < all.length; bi++) {
-    var rec = all[bi];
-    var changed = false;
-    var fs = filesBySub[rec.id] || {};
+  // אילו גיבויים צריך לקרוא: כל מה שחסר בטבלה + מה שהשתנה מאז הריצה הקודמת (או הכול בסריקה מלאה)
+  var toRead = {}, since = lastRun - 3 * 60000, it = backupFolder_().getFiles();
+  while (it.hasNext()) {
+    var f = it.next(), id = f.getName().replace(/\.json$/, '');
+    if (full || !idsInSheet[id] || f.getLastUpdated().getTime() > since) {
+      var tt = f.getLastUpdated().getTime();
+      if (!toRead[id] || tt > toRead[id].t) toRead[id] = { t: tt, f: f };
+    }
+  }
+  var ids = Object.keys(toRead);
+  var filesBySub = {};
+  if (ids.length) {
+    var mit = DriveApp.getFolderById(props.getProperty('FOLDER_ID')).getFiles();
+    while (mit.hasNext()) {
+      var mf = mit.next();
+      var m = String(mf.getDescription() || '').match(/submission:([0-9a-f-]+) kind:(photo|video)/i);
+      if (m) { filesBySub[m[1]] = filesBySub[m[1]] || {}; filesBySub[m[1]][m[2]] = mf.getId(); }
+    }
+  }
+  var restored = [], deferred = 0, fixed = 0;
+  for (var i = 0; i < ids.length; i++) {
+    if (Date.now() - t0 > 4.5 * 60000) break;     // לא לחרוג מזמן ריצה
+    var rec;
+    try { rec = JSON.parse(toRead[ids[i]].f.getBlob().getDataAsString()); } catch (e) { continue; }
+    if (!rec || !rec.id) continue;
+    var changed = false, fs = filesBySub[rec.id] || {};
     if (!rec.photoId && fs.photo) { rec.photoId = fs.photo; changed = true; }
     if (!rec.videoId && fs.video) { rec.videoId = fs.video; changed = true; }
     if (rec.status === STATUS.UPLOADING || rec.status === STATUS.STUCK || rec.status === STATUS.NO_PHOTO) {
-      var old = rec.status;
-      var stale = Date.now() - (rec.createdMs || 0) > CONFIG.stuckAfterMin * 60000;
-      if (rec.wantsPhoto === undefined) rec.wantsPhoto = true;   // הרשמות מלפני שהתמונה הפכה לרשות
+      var old = rec.status, stale = Date.now() - (rec.createdMs || 0) > CONFIG.stuckAfterMin * 60000;
+      if (rec.wantsPhoto === undefined) rec.wantsPhoto = true;
       var st = statusFor_(rec, stale, false);
       if (st !== STATUS.UPLOADING || !stale) rec.status = st;
       if (stale && rec.status === STATUS.UPLOADING) rec.status = STATUS.STUCK;
       if (rec.status !== old) changed = true;
     }
-    if (changed) { writeBackup_(rec); fixed.push(rec.name); }
+    if (changed) { writeBackup_(rec); fixed++; }
     if (changed || !idsInSheet[rec.id]) {
-      if (!idsInSheet[rec.id]) restored.push(rec.name);
-      upsertRow_(rec);
+      if (upsertRow_(rec, 25000) === null) continue;
+      if (!idsInSheet[rec.id]) {
+        // הרשמה חדשה שהטבלה פשוט הייתה עמוסה מדי לכתוב אותה = צפוי; הרשמה ישנה שנעלמה = מישהו מחק שורה
+        if (Date.now() - (rec.createdMs || 0) > 60 * 60000) restored.push(rec.name); else deferred++;
+      }
     }
   }
-  if (restored.length) alertOwner_('שוחזרו שורות לטבלה', 'ההרשמות הבאות היו חסרות בטבלה ושוחזרו מהגיבוי:\n' + restored.join('\n'));
-  return { restored: restored.length, fixed: fixed.length };
+  props.setProperty('RECON_MS', String(t0));
+  if (full) props.setProperty('RECON_FULL_MS', String(t0));
+  if (restored.length) alertOwner_('שוחזרו שורות לטבלה', 'ההרשמות הבאות היו חסרות בטבלה (כנראה נמחקו) ושוחזרו מהגיבוי:\n' + restored.join('\n'));
+  return { read: ids.length, restored: restored.length, deferred: deferred, fixed: fixed, full: full };
 }
 
+// ====================================================================
+// בדיקת תקינות – משמשת את NAPA (וואטסאפ) ואת ההתראה במייל
+// ====================================================================
+function health() {
+  var problems = [], stats = {};
+  try {
+    var sh = sheet_(); stats.rows = Math.max(0, sh.getLastRow() - 1);
+  } catch (e) { problems.push('הטבלה לא נגישה: ' + e); }
+  try {
+    var it = backupFolder_().getFiles(), n = 0; while (it.hasNext() && n < 100000) { it.next(); n++; }
+    stats.backups = n;
+  } catch (e) { problems.push('תיקיית הגיבוי לא נגישה: ' + e); }
+  if (stats.rows !== undefined && stats.backups !== undefined && stats.backups - stats.rows > 25)
+    problems.push('יש ' + (stats.backups - stats.rows) + ' הרשמות שעוד לא נכנסו לטבלה');
+  var lastRun = Number(props_().getProperty('RECON_MS') || 0);
+  stats.minutesSinceReconcile = lastRun ? Math.round((Date.now() - lastRun) / 60000) : null;
+  if (!lastRun || Date.now() - lastRun > 25 * 60000) problems.push('מנגנון השחזור האוטומטי לא רץ מעל 25 דקות');
+  stats.requests10m = readCounter_('REQ');
+  stats.serverErrors10m = readCounter_('ERR');
+  stats.sheetDeferred10m = readCounter_('SHEET_DEFERRED');
+  if (stats.serverErrors10m >= 10 && stats.serverErrors10m > stats.requests10m * 0.1)
+    problems.push(stats.serverErrors10m + ' תקלות שרת ב-20 הדקות האחרונות (מתוך ' + stats.requests10m + ' בקשות)');
+  try {
+    var used = DriveApp.getStorageUsed(), limit = DriveApp.getStorageLimit();
+    stats.driveUsedGB = Math.round(used / 1e8) / 10; stats.driveLimitGB = limit ? Math.round(limit / 1e8) / 10 : null;
+    if (limit && used / limit > 0.9) problems.push('נפח הדרייב כמעט מלא: ' + stats.driveUsedGB + ' מתוך ' + stats.driveLimitGB + ' GB');
+  } catch (e) {}
+  return { ok: problems.length === 0, problems: problems, stats: stats, checkedAt: now_('dd/MM/yyyy HH:mm') };
+}
+
+// רץ כל 5 דקות: שחזור + בדיקת תקינות + התראה במייל (לא יותר מפעם ב-30 דקות על אותה בעיה)
+function monitor() {
+  var res = {};
+  try { res.reconcile = reconcile(); } catch (e) { bumpCounter_('ERR', 600); res.reconcileError = String(e); }
+  var h = health();
+  if (res.reconcileError) { h.ok = false; h.problems.push('שחזור אוטומטי נכשל: ' + res.reconcileError); }
+  var p = props_(), key = h.problems.join(' | ');
+  if (!h.ok) {
+    var lastKey = p.getProperty('ALERT_KEY'), lastAt = Number(p.getProperty('ALERT_AT') || 0);
+    if (key !== lastKey || Date.now() - lastAt > 30 * 60000) {
+      alertOwner_('בעיה בטופס ההרשמה', h.problems.join('\n') + '\n\n' + JSON.stringify(h.stats, null, 2));
+      p.setProperty('ALERT_KEY', key); p.setProperty('ALERT_AT', String(Date.now()));
+    }
+  } else if (p.getProperty('ALERT_KEY')) {
+    alertOwner_('הטופס חזר לעבוד תקין ✓', JSON.stringify(h.stats, null, 2));
+    p.deleteProperty('ALERT_KEY');
+  }
+  return h;
+}
 
 // ====================================================================
 // כיסוי גילאים – טבלה חיה (נוסחאות) של כמה מועמדים יש לכל גיל 1–100
