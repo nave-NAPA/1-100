@@ -44,9 +44,9 @@ function now_(fmt) { return Utilities.formatDate(new Date(), 'Asia/Jerusalem', f
 // ---------- Web app / API ----------
 // הדף עצמו מתארח מחוץ לגוגל (GitHub Pages) כדי שהתחברות לחשבונות גוגל לא תפריע למשתתפים.
 // כאן רק API: הדף שולח POST עם {fn, args} ומקבל JSON.
-var PUBLIC_PAGE_URL = 'https://nave-napa.github.io/saltiz-signup/';
+var PUBLIC_PAGE_URL = 'https://thesaltiz.github.io/1-100/';
 var API = { beginSubmission: beginSubmission, newSession: newSession, startUpload: startUpload, uploadChunk: uploadChunk, finalize: finalize };
-var ALLOWED_ORIGINS = ['https://nave-napa.github.io'];
+var ALLOWED_ORIGINS = ['https://thesaltiz.github.io', 'https://nave-napa.github.io'];
 
 function doPost(e) {
   var out;
