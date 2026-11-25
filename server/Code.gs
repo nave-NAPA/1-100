@@ -132,14 +132,15 @@ function backupFolder_() { return DriveApp.getFolderById(props_().getProperty('B
 function writeBackup_(rec) {
   var name = rec.id + '.json';
   var content = JSON.stringify(rec, null, 2);
-  var it = backupFolder_().getFilesByName(name);
-  if (it.hasNext()) it.next().setContent(content);
-  else backupFolder_().createFile(name, content, MimeType.PLAIN_TEXT);
+  var it = backupFolder_().getFilesByName(name), found = false;
+  while (it.hasNext()) { it.next().setContent(content); found = true; }   // אם נוצר כפול – כולם מתעדכנים
+  if (!found) backupFolder_().createFile(name, content, MimeType.PLAIN_TEXT);
 }
 
 function readBackup_(id) {
-  var it = backupFolder_().getFilesByName(id + '.json');
-  return it.hasNext() ? JSON.parse(it.next().getBlob().getDataAsString()) : null;
+  var it = backupFolder_().getFilesByName(id + '.json'), best = null, bestT = -1;
+  while (it.hasNext()) { var f = it.next(), t = f.getLastUpdated().getTime(); if (t > bestT) { best = f; bestT = t; } }
+  return best ? JSON.parse(best.getBlob().getDataAsString()) : null;
 }
 
 // ---------- טבלה ----------
@@ -207,6 +208,10 @@ function upsertRow_(rec) {
     var sh = sheet_();
     var row = findRow_(sh, rec.id);
     var num;
+    if (row) {   // מחיקת שורות כפולות עם אותו מזהה (אם נוצרו)
+      var ids2 = sh.getRange(2, COL.id, sh.getLastRow() - 1, 1).getValues();
+      for (var q = ids2.length - 1; q >= 0; q--) if (String(ids2[q][0]) === rec.id && q + 2 !== row && q + 2 < row) { sh.deleteRow(q + 2); row--; }
+    }
     if (!row) { row = sh.getLastRow() + 1; num = row - 1; }
     else num = sh.getRange(row, COL.num).getValue() || row - 1;
     var v = rowValues_(rec, num);
@@ -459,12 +464,9 @@ function reconcile() {
   if (last >= 2) sh.getRange(2, COL.id, last - 1, 1).getValues().forEach(function (r) { idsInSheet[String(r[0])] = true; });
 
   var restored = [], fixed = [];
-  var bit = backupFolder_().getFiles();
-  while (bit.hasNext()) {
-    var bf = bit.next();
-    var rec;
-    try { rec = JSON.parse(bf.getBlob().getDataAsString()); } catch (e) { continue; }
-    if (!rec || !rec.id) continue;
+  var all = allBackups_();
+  for (var bi = 0; bi < all.length; bi++) {
+    var rec = all[bi];
     var changed = false;
     var fs = filesBySub[rec.id] || {};
     if (!rec.photoId && fs.photo) { rec.photoId = fs.photo; changed = true; }
@@ -591,7 +593,8 @@ function buildPlan() {
     var main = sheet_(), last = main.getLastRow();
     var data = last >= 2 ? main.getRange(2, 1, last - 1, HEADERS.length).getValues() : [];
     var cands = [];
-    var ids = data.map(function (r) { return String(r[COL.id - 1]); });
+    var seenIds = {};
+    var ids = data.map(function (r) { return String(r[COL.id - 1]); }).filter(function (id) { if (!id || seenIds[id]) return false; seenIds[id] = 1; return true; });
     ids.forEach(function (id, i) {
       var rec = readBackup_(id); if (!rec) return;
       var av = availabilityOf_(rec), slots = [];
@@ -632,10 +635,22 @@ function buildPlan() {
   } finally { lock.releaseLock(); }
 }
 
+// כל ההרשמות מהגיבוי, בלי כפילויות (אם יש שני קבצים לאותה הרשמה – העדכני ביותר)
+function allBackups_() {
+  var byId = {}, it = backupFolder_().getFiles();
+  while (it.hasNext()) {
+    var f = it.next(), r;
+    try { r = JSON.parse(f.getBlob().getDataAsString()); } catch (e) { continue; }
+    if (!r || !r.id) continue;
+    var t = f.getLastUpdated().getTime();
+    if (!byId[r.id] || t > byId[r.id].t) byId[r.id] = { t: t, rec: r };
+  }
+  return Object.keys(byId).map(function (k) { return byId[k].rec; });
+}
+
 // בנייה מחדש של הטבלה הראשית מכל קבצי הגיבוי (מעבר לפורמט החדש)
 function rebuildMainFromBackups() {
-  var recs = [], it = backupFolder_().getFiles();
-  while (it.hasNext()) { try { var r = JSON.parse(it.next().getBlob().getDataAsString()); if (r && r.id) recs.push(r); } catch (e) {} }
+  var recs = allBackups_();
   recs.sort(function (a, b) { return (a.createdMs || 0) - (b.createdMs || 0); });
   var sh = sheet_();
   var lock = LockService.getScriptLock(); lock.waitLock(30000);
