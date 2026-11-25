@@ -134,8 +134,9 @@ function setup() {
   }
   // מנגנון שחזור אוטומטי כל 15 דקות
   ScriptApp.getProjectTriggers().forEach(function (t) { if (t.getHandlerFunction() === 'reconcile') ScriptApp.deleteTrigger(t); });
-  var hasMon = ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === 'monitor'; });
-  if (!hasMon) ScriptApp.newTrigger('monitor').timeBased().everyMinutes(5).create();
+  var hs = function (n) { return ScriptApp.getProjectTriggers().some(function (t) { return t.getHandlerFunction() === n; }); };
+  if (!hs('syncSheet')) ScriptApp.newTrigger('syncSheet').timeBased().everyMinutes(1).create();
+  if (!hs('monitor')) ScriptApp.newTrigger('monitor').timeBased().everyMinutes(5).create();
   return { sheetUrl: ss.getUrl(), folderUrl: folder.getUrl() };
 }
 
@@ -225,9 +226,15 @@ function rangesText_(times) {
 }
 
 // כתיבה/עדכון שורה לפי מזהה (idempotent)
+// בבקשות של משתתפים מחכים לטבלה לכל היותר 1.5 שניות. אם היא תפוסה – הגיבוי כבר שמור,
+// ותהליך הרקע (כל דקה) מכניס את השורה. כך אף משתתף לא מחכה בתור בזמן עומס.
 function upsertRow_(rec, waitMs) {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(waitMs || 20000)) { bumpCounter_('SHEET_DEFERRED', 1200); return null; }   // עמוס – הגיבוי שמור, reconcile ישלים
+  if (!lock.tryLock(waitMs || 1500)) {
+    bumpCounter_('SHEET_DEFERRED', 1200);
+    try { cache_().put('SHEET_PENDING', '1', 21600); } catch (e) {}
+    return null;
+  }
   try {
     var sh = sheet_();
     var row = findRow_(sh, rec.id);
@@ -245,6 +252,9 @@ function upsertRow_(rec, waitMs) {
     sh.getRange(row, 1, 1, v.length).setBackground(color);
     SpreadsheetApp.flush();
     return num;
+  } catch (err) {
+    try { cache_().put('SHEET_PENDING', '1', 21600); } catch (e) {}   // תקלה בטבלה – תהליך הרקע ינסה שוב
+    throw err;
   } finally {
     lock.releaseLock();
   }
@@ -479,15 +489,30 @@ function reconcile() {
   var lastFull = Number(props.getProperty('RECON_FULL_MS') || 0);
   var lastRun = Number(props.getProperty('RECON_MS') || 0);
   var full = t0 - lastFull > 60 * 60000;   // סריקה מלאה פעם בשעה, ובשאר הפעמים רק מה שהשתנה
+  // רץ כל דקה: אם אין שורות שממתינות וזו לא סריקה מלאה – יוצאים מיד (חוסך זמן ריצה)
+  var pending = cache_().get('SHEET_PENDING');
+  var rowsNow = Math.max(0, sheet_().getLastRow() - 1), rowsBefore = Number(props.getProperty('RECON_ROWS') || 0);
+  var shrunk = rowsNow < rowsBefore;   // מישהו מחק שורה – לשחזר מיד
+  // שורות שעדיין "מעלה קבצים…" (למשל משתתף שסגר את הדף) – לבדוק אותן בכל ריצה
+  var openIds = {};
+  if (rowsNow) sheet_().getRange(2, COL.status, rowsNow, 1).getValues().forEach(function (r, i) {
+    if (String(r[0]) === STATUS.UPLOADING) openIds['row' + i] = 1;
+  });
+  var hasOpen = Object.keys(openIds).length > 0;
+  if (!full && !pending && !shrunk && !hasOpen && lastRun && t0 - lastRun < 6 * 60000) { props.setProperty('RECON_TICK', String(t0)); props.setProperty('RECON_ROWS', String(rowsNow)); return { skipped: true }; }
+  if (pending) cache_().remove('SHEET_PENDING');
 
-  var sh = sheet_(), last = sh.getLastRow(), idsInSheet = {};
-  if (last >= 2) sh.getRange(2, COL.id, last - 1, 1).getValues().forEach(function (r) { idsInSheet[String(r[0])] = true; });
+  var sh = sheet_(), last = sh.getLastRow(), idsInSheet = {}, uploadingIds = {};
+  if (last >= 2) sh.getRange(2, COL.status, last - 1, COL.id - COL.status + 1).getValues().forEach(function (r) {
+    var id = String(r[r.length - 1]); idsInSheet[id] = true;
+    if (String(r[0]) === STATUS.UPLOADING) uploadingIds[id] = true;
+  });
 
   // אילו גיבויים צריך לקרוא: כל מה שחסר בטבלה + מה שהשתנה מאז הריצה הקודמת (או הכול בסריקה מלאה)
   var toRead = {}, since = lastRun - 3 * 60000, it = backupFolder_().getFiles();
   while (it.hasNext()) {
     var f = it.next(), id = f.getName().replace(/\.json$/, '');
-    if (full || !idsInSheet[id] || f.getLastUpdated().getTime() > since) {
+    if (full || !idsInSheet[id] || uploadingIds[id] || f.getLastUpdated().getTime() > since) {
       var tt = f.getLastUpdated().getTime();
       if (!toRead[id] || tt > toRead[id].t) toRead[id] = { t: tt, f: f };
     }
@@ -529,6 +554,7 @@ function reconcile() {
     }
   }
   props.setProperty('RECON_MS', String(t0));
+  props.setProperty('RECON_ROWS', String(Math.max(0, sheet_().getLastRow() - 1)));
   if (full) props.setProperty('RECON_FULL_MS', String(t0));
   if (restored.length) alertOwner_('שוחזרו שורות לטבלה', 'ההרשמות הבאות היו חסרות בטבלה (כנראה נמחקו) ושוחזרו מהגיבוי:\n' + restored.join('\n'));
   return { read: ids.length, restored: restored.length, deferred: deferred, fixed: fixed, full: full };
@@ -549,8 +575,9 @@ function health() {
   if (stats.rows !== undefined && stats.backups !== undefined && stats.backups - stats.rows > 25)
     problems.push('יש ' + (stats.backups - stats.rows) + ' הרשמות שעוד לא נכנסו לטבלה');
   var lastRun = Number(props_().getProperty('RECON_MS') || 0);
-  stats.minutesSinceReconcile = lastRun ? Math.round((Date.now() - lastRun) / 60000) : null;
-  if (!lastRun || Date.now() - lastRun > 25 * 60000) problems.push('מנגנון השחזור האוטומטי לא רץ מעל 25 דקות');
+  var tick = Math.max(lastRun, Number(props_().getProperty('RECON_TICK') || 0));
+  stats.minutesSinceReconcile = tick ? Math.round((Date.now() - tick) / 60000) : null;
+  if (!tick || Date.now() - tick > 15 * 60000) problems.push('מנגנון השחזור האוטומטי לא רץ מעל 15 דקות');
   stats.requests10m = readCounter_('REQ');
   stats.serverErrors10m = readCounter_('ERR');
   stats.sheetDeferred10m = readCounter_('SHEET_DEFERRED');
@@ -564,12 +591,17 @@ function health() {
   return { ok: problems.length === 0, problems: problems, stats: stats, checkedAt: now_('dd/MM/yyyy HH:mm') };
 }
 
-// רץ כל 5 דקות: שחזור + בדיקת תקינות + התראה במייל (לא יותר מפעם ב-30 דקות על אותה בעיה)
+// טריגר כל דקה: מכניס לטבלה הרשמות שנשמרו רק בגיבוי (בזמן עומס) ומשלים קבצים
+function syncSheet() {
+  try { var r = reconcile(); props_().deleteProperty('RECON_ERR'); return r; }
+  catch (e) { props_().setProperty('RECON_ERR', String(e).substring(0, 300)); bumpCounter_('ERR', 600); throw e; }
+}
+
+// רץ כל 5 דקות: בדיקת תקינות + התראה במייל (לא יותר מפעם ב-30 דקות על אותה בעיה)
 function monitor() {
-  var res = {};
-  try { res.reconcile = reconcile(); } catch (e) { bumpCounter_('ERR', 600); res.reconcileError = String(e); }
   var h = health();
-  if (res.reconcileError) { h.ok = false; h.problems.push('שחזור אוטומטי נכשל: ' + res.reconcileError); }
+  var re = props_().getProperty('RECON_ERR');
+  if (re) { h.ok = false; h.problems.push('שחזור אוטומטי נכשל: ' + re); }
   var p = props_(), key = h.problems.join(' | ');
   if (!h.ok) {
     var lastKey = p.getProperty('ALERT_KEY'), lastAt = Number(p.getProperty('ALERT_AT') || 0);
