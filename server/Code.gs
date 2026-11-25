@@ -225,6 +225,39 @@ function rangesText_(times) {
   return out.join(', ');
 }
 
+// כתיבה של הרבה שורות בבת אחת (לתהליך הרקע): עדכון שורות קיימות + הוספת חדשות בבלוק אחד
+function batchUpsert_(recs) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(25000)) return false;
+  try {
+    var sh = sheet_(), last = sh.getLastRow(), rowOf = {};
+    if (last >= 2) sh.getRange(2, COL.id, last - 1, 1).getValues().forEach(function (r, i) { rowOf[String(r[0])] = i + 2; });
+    var appends = [], appendRecs = [];
+    recs.forEach(function (rec) {
+      var row = rowOf[rec.id];
+      if (row) {
+        var num = sh.getRange(row, COL.num).getValue() || row - 1, v = rowValues_(rec, num);
+        sh.getRange(row, 1, 1, v.length).setValues([v]).setBackground(rowColor_(rec, row));
+      } else { appendRecs.push(rec); }
+    });
+    if (appendRecs.length) {
+      var start = sh.getLastRow() + 1;
+      appendRecs.sort(function (a, b) { return (a.createdMs || 0) - (b.createdMs || 0); });
+      appends = appendRecs.map(function (rec, k) { return rowValues_(rec, start + k - 1); });
+      sh.getRange(start, 1, appends.length, HEADERS.length).setValues(appends).setVerticalAlignment('middle');
+      sh.getRange(start, 1, appends.length, HEADERS.length).setBackgrounds(appendRecs.map(function (rec, k) {
+        var col = rowColor_(rec, start + k); return HEADERS.map(function () { return col; });
+      }));
+    }
+    SpreadsheetApp.flush();
+    return true;
+  } finally { lock.releaseLock(); }
+}
+
+function rowColor_(rec, row) {
+  return rec.status === STATUS.DONE ? (row % 2 ? '#ffffff' : '#F4F1FF') : rec.status === STATUS.UPLOADING ? '#FFF8E1' : '#FDE7EA';
+}
+
 // כתיבה/עדכון שורה לפי מזהה (idempotent)
 // בבקשות של משתתפים מחכים לטבלה לכל היותר 1.5 שניות. אם היא תפוסה – הגיבוי כבר שמור,
 // ותהליך הרקע (כל דקה) מכניס את השורה. כך אף משתתף לא מחכה בתור בזמן עומס.
@@ -527,7 +560,7 @@ function reconcile() {
       if (m) { filesBySub[m[1]] = filesBySub[m[1]] || {}; filesBySub[m[1]][m[2]] = mf.getId(); }
     }
   }
-  var restored = [], deferred = 0, fixed = 0;
+  var restored = [], deferred = 0, fixed = 0, batch = [];
   for (var i = 0; i < ids.length; i++) {
     if (Date.now() - t0 > 4.5 * 60000) break;     // לא לחרוג מזמן ריצה
     var rec;
@@ -546,13 +579,14 @@ function reconcile() {
     }
     if (changed) { writeBackup_(rec); fixed++; }
     if (changed || !idsInSheet[rec.id]) {
-      if (upsertRow_(rec, 25000) === null) continue;
+      batch.push(rec);
       if (!idsInSheet[rec.id]) {
         // הרשמה חדשה שהטבלה פשוט הייתה עמוסה מדי לכתוב אותה = צפוי; הרשמה ישנה שנעלמה = מישהו מחק שורה
         if (Date.now() - (rec.createdMs || 0) > 60 * 60000) restored.push(rec.name); else deferred++;
       }
     }
   }
+  if (batch.length && !batchUpsert_(batch)) { try { cache_().put('SHEET_PENDING', '1', 21600); } catch (e) {} }
   props.setProperty('RECON_MS', String(t0));
   props.setProperty('RECON_ROWS', String(Math.max(0, sheet_().getLastRow() - 1)));
   if (full) props.setProperty('RECON_FULL_MS', String(t0));
