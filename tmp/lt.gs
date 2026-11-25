@@ -158,9 +158,14 @@ function backupFolder_() { return DriveApp.getFolderById(props_().getProperty(LO
 function writeBackup_(rec) {
   var name = rec.id + '.json';
   var content = JSON.stringify(rec, null, 2);
+  try { cache_().put('rec_' + (LOADTEST_ ? 'lt_' : '') + rec.id, content, 21600); } catch (e) {}   // עותק מהיר לתהליך הרקע
+  // לפי מזהה הקובץ (עקבי מיד) – כדי שעדכון מהיר אחרי יצירה לא ייצור קובץ כפול
+  var fidKey = 'bfid_' + (LOADTEST_ ? 'lt_' : '') + rec.id, fid = null;
+  try { fid = cache_().get(fidKey); } catch (e) {}
+  if (fid) { try { DriveApp.getFileById(fid).setContent(content); return; } catch (e) {} }
   var it = backupFolder_().getFilesByName(name), found = false;
-  while (it.hasNext()) { it.next().setContent(content); found = true; }   // אם נוצר כפול – כולם מתעדכנים
-  if (!found) backupFolder_().createFile(name, content, MimeType.PLAIN_TEXT);
+  while (it.hasNext()) { var bf = it.next(); bf.setContent(content); found = true; try { cache_().put(fidKey, bf.getId(), 21600); } catch (e) {} }   // אם נוצר כפול – כולם מתעדכנים
+  if (!found) { var nf = backupFolder_().createFile(name, content, MimeType.PLAIN_TEXT); try { cache_().put(fidKey, nf.getId(), 21600); } catch (e) {} }
 }
 
 function readBackup_(id) {
@@ -553,6 +558,12 @@ function reconcile() {
     }
   }
   var ids = Object.keys(toRead);
+  // קריאה מהירה מהמטמון בבת אחת; רק מה שלא נמצא שם נקרא מהדרייב
+  var cached = {};
+  for (var ci = 0; ci < ids.length; ci += 100) {
+    try { var got = cache_().getAll(ids.slice(ci, ci + 100).map(function (x) { return 'rec_' + (LOADTEST_ ? 'lt_' : '') + x; }));
+      Object.keys(got).forEach(function (k) { cached[k.replace(/^rec_(lt_)?/, '')] = got[k]; }); } catch (e) {}
+  }
   var filesBySub = {};
   if (ids.length) {
     var mit = DriveApp.getFolderById(props.getProperty('FOLDER_ID')).getFiles();
@@ -566,7 +577,7 @@ function reconcile() {
   for (var i = 0; i < ids.length; i++) {
     if (Date.now() - t0 > 4.5 * 60000) break;     // לא לחרוג מזמן ריצה
     var rec;
-    try { rec = JSON.parse(toRead[ids[i]].f.getBlob().getDataAsString()); } catch (e) { continue; }
+    try { rec = JSON.parse(cached[ids[i]] || toRead[ids[i]].f.getBlob().getDataAsString()); } catch (e) { continue; }
     if (!rec || !rec.id) continue;
     var changed = false, fs = filesBySub[rec.id] || {};
     if (!rec.photoId && fs.photo) { rec.photoId = fs.photo; changed = true; }
@@ -860,3 +871,5 @@ function loadTestCleanup() {
   var id = props_().getProperty('LT_BACKUP_ID');
   if (id) { DriveApp.getFolderById(id).setTrashed(true); props_().deleteProperty('LT_BACKUP_ID'); }
 }
+
+function loadTestReset() { loadTestCleanup(); loadTestSetup(); }
